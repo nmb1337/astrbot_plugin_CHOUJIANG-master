@@ -1,0 +1,9 @@
+name: astrbot_plugin_choujiang
+display_name: 群抽奖助手
+desc: 支持报名抽奖、定时开奖、奖品自定义、未报名成员定时提醒。
+version: v1.0.0
+author: GitHubCopilot
+repo: https://github.com/AstrBotDevs/AstrBot
+support_platforms:
+  - aiocqhttp
+astrbot_version: ">=4.9.2"
