@@ -5,22 +5,25 @@ from datetime import datetime, timedelta
 from typing import Any
 
 import astrbot.api.message_components as Comp
-from astrbot.api import logger
+from astrbot.api import AstrBotConfig, logger
 from astrbot.api.event import AstrMessageEvent, MessageChain, filter
 from astrbot.api.star import Context, Star, register
 
 STATE_KEY = "choujiang_state_v1"
-CHECK_INTERVAL_SECONDS = 2
-MAX_REMIND_MENTIONS = 50
 
 
 @register("astrbot_plugin_choujiang", "GitHubCopilot", "群聊抽奖插件（报名、定时开奖、定时提醒）", "1.0.0")
 class ChouJiangPlugin(Star):
-    def __init__(self, context: Context):
+    def __init__(self, context: Context, config: AstrBotConfig | None = None):
         super().__init__(context)
+        self.config: dict[str, Any] = config or {}
         self._state: dict[str, Any] = {"lotteries": {}}
         self._lock = asyncio.Lock()
         self._ticker_task: asyncio.Task | None = None
+        self._check_interval_seconds = self._cfg_int("check_interval_seconds", 2, minimum=1, maximum=60)
+        self._max_remind_mentions = self._cfg_int("max_remind_mentions", 50, minimum=1, maximum=200)
+        self._default_remind_before_text = self._cfg_str("default_remind_before", "30m")
+        self._default_remind_before_delta = self._parse_duration(self._default_remind_before_text)
 
     async def initialize(self):
         saved = await self.get_kv_data(STATE_KEY, {"lotteries": {}})
@@ -85,6 +88,8 @@ class ChouJiangPlugin(Star):
             yield event.plain_result("奖品不能为空。")
             return
 
+        remind_time = self._compute_default_remind_time(draw_time, now)
+
         key = self._group_key(event)
         lottery = {
             "platform": event.get_platform_name(),
@@ -95,7 +100,7 @@ class ChouJiangPlugin(Star):
             "self_id": event.get_self_id(),
             "prize": prize,
             "draw_time": draw_time.isoformat(),
-            "remind_time": None,
+            "remind_time": remind_time.isoformat() if remind_time else None,
             "reminded": False,
             "participants": {},
             "status": "open",
@@ -107,8 +112,13 @@ class ChouJiangPlugin(Star):
             self._state["lotteries"][key] = lottery
             await self._save_state()
 
+        remind_desc = (
+            f"\n默认提醒时间: {remind_time.strftime('%Y-%m-%d %H:%M:%S')}"
+            if remind_time
+            else "\n默认提醒未启用（可在插件配置中设置 default_remind_before）"
+        )
         yield event.plain_result(
-            f"抽奖已创建。\n奖品: {prize}\n开奖时间: {draw_time.strftime('%Y-%m-%d %H:%M:%S')}\n发送 /抽奖报名 参与抽奖。"
+            f"抽奖已创建。\n奖品: {prize}\n开奖时间: {draw_time.strftime('%Y-%m-%d %H:%M:%S')}{remind_desc}\n发送 /抽奖报名 参与抽奖。"
         )
 
     @filter.command("抽奖报名")
@@ -208,7 +218,11 @@ class ChouJiangPlugin(Star):
             lottery["draw_time"] = draw_time.isoformat()
             remind_time = self._parse_iso_time(lottery.get("remind_time"))
             if remind_time and remind_time >= draw_time:
-                lottery["remind_time"] = None
+                remind_time = None
+            if not remind_time:
+                remind_time = self._compute_default_remind_time(draw_time, datetime.now())
+            lottery["remind_time"] = remind_time.isoformat() if remind_time else None
+            if remind_time:
                 lottery["reminded"] = False
             await self._save_state()
 
@@ -333,7 +347,7 @@ class ChouJiangPlugin(Star):
     async def _scheduler_loop(self):
         while True:
             try:
-                await asyncio.sleep(CHECK_INTERVAL_SECONDS)
+                await asyncio.sleep(self._check_interval_seconds)
                 remind_jobs: list[dict[str, Any]] = []
                 draw_jobs: list[dict[str, Any]] = []
 
@@ -400,7 +414,7 @@ class ChouJiangPlugin(Star):
                     not_joined.append(uid)
 
             if not_joined:
-                shown = not_joined[:MAX_REMIND_MENTIONS]
+                shown = not_joined[: self._max_remind_mentions]
                 for uid in shown:
                     components.append(Comp.At(qq=uid))
                 remain = len(not_joined) - len(shown)
@@ -587,3 +601,26 @@ class ChouJiangPlugin(Star):
             except ValueError:
                 continue
         return None
+
+    def _cfg_int(self, key: str, default: int, *, minimum: int, maximum: int) -> int:
+        try:
+            value = int(self.config.get(key, default))
+        except Exception:
+            return default
+        return max(minimum, min(maximum, value))
+
+    def _cfg_str(self, key: str, default: str) -> str:
+        try:
+            value = str(self.config.get(key, default)).strip()
+        except Exception:
+            return default
+        return value
+
+    def _compute_default_remind_time(self, draw_time: datetime, now: datetime) -> datetime | None:
+        delta = self._default_remind_before_delta
+        if not delta:
+            return None
+        remind_time = draw_time - delta
+        if remind_time <= now:
+            return None
+        return remind_time

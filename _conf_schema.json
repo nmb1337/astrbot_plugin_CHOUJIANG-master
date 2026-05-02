@@ -1,0 +1,20 @@
+{
+  "check_interval_seconds": {
+    "description": "定时器检查间隔（秒）",
+    "type": "int",
+    "hint": "插件轮询提醒与开奖的周期。建议 1-5 秒。",
+    "default": 2
+  },
+  "max_remind_mentions": {
+    "description": "单次提醒最多@人数",
+    "type": "int",
+    "hint": "未报名成员过多时会截断@数量，避免刷屏。",
+    "default": 50
+  },
+  "default_remind_before": {
+    "description": "默认开奖前提醒时长",
+    "type": "string",
+    "hint": "创建抽奖时会自动生成提醒时间。支持格式: 30m、2h、45s、1d；留空表示不自动设置。",
+    "default": "30m"
+  }
+}

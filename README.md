@@ -14,6 +14,14 @@ AstrBot 群抽奖插件，支持：
 - AstrBot >= 4.9.2（使用插件 KV 存储）
 - 推荐平台：aiocqhttp（支持获取群成员并逐个提醒）
 
+## WebUI 配置项
+
+插件已注册配置（可在插件配置页修改）：
+
+- `check_interval_seconds`：定时轮询间隔秒数（默认 `2`）
+- `max_remind_mentions`：单次提醒最多 @ 的人数（默认 `50`）
+- `default_remind_before`：默认开奖前提醒时长（默认 `30m`，留空则不自动设置提醒）
+
 ## 指令说明
 
 - `/抽奖帮助`
