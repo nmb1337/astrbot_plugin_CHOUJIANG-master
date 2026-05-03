@@ -7,6 +7,8 @@ from typing import Any
 import astrbot.api.message_components as Comp
 from astrbot.api import AstrBotConfig, logger
 from astrbot.api.event import AstrMessageEvent, MessageChain, filter
+from astrbot.core.platform.message_session import MessageSession
+from astrbot.core.platform.message_type import MessageType
 from astrbot.api.star import Context, Star, register
 
 STATE_KEY = "choujiang_state_v1"
@@ -434,7 +436,12 @@ class ChouJiangPlugin(Star):
                 )
             )
 
-        await self._send_chain(umo, components)
+        await self._send_chain(
+            umo,
+            components,
+            platform_name=str(lottery.get("platform") or ""),
+            group_id=str(lottery.get("group_id") or ""),
+        )
 
     async def _send_draw_announcement(self, payload: dict[str, Any]):
         umo = str(payload.get("unified_msg_origin") or "").strip()
@@ -458,15 +465,82 @@ class ChouJiangPlugin(Star):
         else:
             components.append(Comp.Plain(f" 抽奖开奖时间到！\n奖品：{prize}\n本次无人报名，已流局。"))
 
-        await self._send_chain(umo, components)
+        await self._send_chain(
+            umo,
+            components,
+            platform_name=str(payload.get("platform") or ""),
+            group_id=str(payload.get("group_id") or ""),
+        )
 
-    async def _send_chain(self, unified_msg_origin: str, components: list[Any]):
-        chain = MessageChain()
-        chain.chain.extend(components)
+    async def _send_chain(
+        self,
+        unified_msg_origin: str,
+        components: list[Any],
+        platform_name: str = "",
+        group_id: str = "",
+    ):
+        chain = MessageChain(chain=list(components))
         try:
-            await self.context.send_message(unified_msg_origin, chain)
+            sent = await self.context.send_message(unified_msg_origin, chain)
+            if sent:
+                return
+            logger.warning(f"[抽奖插件] send_message 返回 False: umo={unified_msg_origin}")
         except Exception as ex:
             logger.exception(f"[抽奖插件] 主动发送消息失败: {ex}")
+
+        # 某些群场景机器人没有 @全体 权限，去掉 @全体 后重试一次，避免整条通知丢失。
+        stripped_components = self._strip_at_all_components(components)
+        if len(stripped_components) != len(components):
+            try:
+                fallback_chain = MessageChain(chain=stripped_components)
+                sent = await self.context.send_message(unified_msg_origin, fallback_chain)
+                if sent:
+                    logger.warning("[抽奖插件] 已使用去除@全体的降级消息发送成功")
+                    return
+            except Exception as ex:
+                logger.warning(f"[抽奖插件] 去除@全体后重试仍失败: {ex}")
+
+        # 最后兜底：aiocqhttp 直接按群号发送，绕开 UMO 路由问题。
+        if platform_name == "aiocqhttp" and group_id:
+            direct_components = stripped_components if stripped_components else components
+            if await self._send_aiocqhttp_group_direct(group_id, direct_components):
+                logger.warning("[抽奖插件] 已通过 aiocqhttp 群号直发兜底成功")
+                return
+
+        logger.warning(f"[抽奖插件] 消息发送最终失败: umo={unified_msg_origin}")
+
+    @staticmethod
+    def _strip_at_all_components(components: list[Any]) -> list[Any]:
+        ret: list[Any] = []
+        for comp in components:
+            if isinstance(comp, Comp.AtAll):
+                continue
+            if isinstance(comp, Comp.At) and str(getattr(comp, "qq", "")).lower() == "all":
+                continue
+            ret.append(comp)
+        return ret
+
+    async def _send_aiocqhttp_group_direct(self, group_id: str, components: list[Any]) -> bool:
+        try:
+            adapter = self.context.get_platform(filter.PlatformAdapterType.AIOCQHTTP)
+            if not adapter:
+                return False
+
+            meta = adapter.meta() if hasattr(adapter, "meta") else None
+            platform_id = "aiocqhttp"
+            if meta and getattr(meta, "id", None):
+                platform_id = str(meta.id)
+
+            session = MessageSession(
+                platform_name=platform_id,
+                message_type=MessageType.GROUP_MESSAGE,
+                session_id=str(group_id),
+            )
+            await adapter.send_by_session(session, MessageChain(chain=list(components)))
+            return True
+        except Exception as ex:
+            logger.warning(f"[抽奖插件] aiocqhttp 群号直发失败: {ex}")
+            return False
 
     def _finalize_draw(self, lottery: dict[str, Any]) -> dict[str, Any]:
         participants: dict[str, str] = lottery.get("participants", {}) or {}
@@ -481,6 +555,8 @@ class ChouJiangPlugin(Star):
 
         return {
             "unified_msg_origin": lottery.get("unified_msg_origin"),
+            "platform": lottery.get("platform"),
+            "group_id": lottery.get("group_id"),
             "prize": lottery.get("prize"),
             "participant_count": len(participants),
             "winner": winner,
