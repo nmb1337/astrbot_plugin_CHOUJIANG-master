@@ -16,5 +16,11 @@
     "type": "string",
     "hint": "创建抽奖时会自动生成提醒时间。支持格式: 30m、2h、45s、1d；留空表示不自动设置。",
     "default": "30m"
+  },
+  "default_min_join_level": {
+    "description": "默认报名最低群等级",
+    "type": "int",
+    "hint": "创建抽奖时默认生效的群等级门槛。设置为 0 表示不限制。",
+    "default": 0
   }
 }

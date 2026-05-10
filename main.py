@@ -26,6 +26,7 @@ class ChouJiangPlugin(Star):
         self._max_remind_mentions = self._cfg_int("max_remind_mentions", 50, minimum=1, maximum=200)
         self._default_remind_before_text = self._cfg_str("default_remind_before", "30m")
         self._default_remind_before_delta = self._parse_duration(self._default_remind_before_text)
+        self._default_min_join_level = self._cfg_int("default_min_join_level", 0, minimum=0, maximum=300)
 
     async def initialize(self):
         saved = await self.get_kv_data(STATE_KEY, {"lotteries": {}})
@@ -58,6 +59,8 @@ class ChouJiangPlugin(Star):
             "  也支持相对时间，如: 30m / 2h / 45s\n"
             "/抽奖提醒前 <时长>\n"
             "  例: /抽奖提醒前 30m (开奖前30分钟提醒未报名成员)\n"
+            "/抽奖最低等级 <等级>\n"
+            "  例: /抽奖最低等级 16 (群等级低于16不能报名)\n"
             "/抽奖开奖 (立即开奖)\n"
             "/抽奖取消"
         )
@@ -103,6 +106,7 @@ class ChouJiangPlugin(Star):
             "prize": prize,
             "draw_time": draw_time.isoformat(),
             "remind_time": remind_time.isoformat() if remind_time else None,
+            "min_join_level": self._default_min_join_level,
             "reminded": False,
             "participants": {},
             "status": "open",
@@ -119,8 +123,11 @@ class ChouJiangPlugin(Star):
             if remind_time
             else "\n默认提醒未启用（可在插件配置中设置 default_remind_before）"
         )
+        level_desc = ""
+        if self._default_min_join_level > 0:
+            level_desc = f"\n最低报名群等级: {self._default_min_join_level}"
         yield event.plain_result(
-            f"抽奖已创建。\n奖品: {prize}\n开奖时间: {draw_time.strftime('%Y-%m-%d %H:%M:%S')}{remind_desc}\n发送 /抽奖报名 参与抽奖。"
+            f"抽奖已创建。\n奖品: {prize}\n开奖时间: {draw_time.strftime('%Y-%m-%d %H:%M:%S')}{remind_desc}{level_desc}\n发送 /抽奖报名 参与抽奖。"
         )
 
     @filter.command("抽奖报名")
@@ -143,6 +150,25 @@ class ChouJiangPlugin(Star):
             if uid in participants:
                 yield event.plain_result("你已经报名过了。")
                 return
+
+            min_join_level = self._safe_int(lottery.get("min_join_level"), default=0, minimum=0, maximum=300)
+            if min_join_level > 0:
+                member_level = await self._fetch_aiocqhttp_member_level(
+                    platform_name=str(lottery.get("platform") or ""),
+                    group_id=str(lottery.get("group_id") or ""),
+                    user_id=uid,
+                )
+                if member_level is None:
+                    yield event.plain_result(
+                        f"当前抽奖要求群等级 >= {min_join_level}，暂时无法读取你的群等级，请稍后再试。"
+                    )
+                    return
+                if member_level < min_join_level:
+                    yield event.plain_result(
+                        f"报名失败：当前抽奖要求群等级 >= {min_join_level}，你当前群等级为 {member_level}。"
+                    )
+                    return
+
             participants[uid] = uname
             await self._save_state()
             count = len(participants)
@@ -304,6 +330,43 @@ class ChouJiangPlugin(Star):
             await self._save_state()
 
         yield event.plain_result(f"已设置开奖前提醒: {raw}（触发时间 {remind_time.strftime('%Y-%m-%d %H:%M:%S')}）")
+
+    @filter.command("抽奖最低等级")
+    async def choujiang_set_min_level(self, event: AstrMessageEvent):
+        """设置报名最低群等级"""
+        if not event.get_group_id():
+            yield event.plain_result("该指令仅支持群聊使用。")
+            return
+
+        raw = self._extract_args(event.message_str)
+        if not raw:
+            yield event.plain_result("用法: /抽奖最低等级 <等级>，例如 /抽奖最低等级 16")
+            return
+
+        try:
+            min_level = int(raw)
+        except Exception:
+            yield event.plain_result("等级必须是整数。")
+            return
+
+        if min_level < 0 or min_level > 300:
+            yield event.plain_result("等级范围应在 0-300 之间。设置为 0 表示不限制。")
+            return
+
+        key = self._group_key(event)
+        async with self._lock:
+            lottery = self._state["lotteries"].get(key)
+            if not lottery or lottery.get("status") != "open":
+                yield event.plain_result("当前群没有进行中的抽奖。")
+                return
+
+            lottery["min_join_level"] = min_level
+            await self._save_state()
+
+        if min_level == 0:
+            yield event.plain_result("已取消群等级限制，所有群成员都可报名。")
+        else:
+            yield event.plain_result(f"已设置报名最低群等级: {min_level}")
 
     @filter.command("抽奖开奖")
     async def choujiang_draw_now(self, event: AstrMessageEvent):
@@ -615,6 +678,46 @@ class ChouJiangPlugin(Star):
             logger.warning(f"[抽奖插件] 获取群成员失败，回退到 @全体 提醒: {ex}")
             return []
 
+    async def _fetch_aiocqhttp_member_level(
+        self,
+        platform_name: str,
+        group_id: str,
+        user_id: str,
+    ) -> int | None:
+        if platform_name != "aiocqhttp" or not group_id or not user_id:
+            return None
+
+        try:
+            adapter = self.context.get_platform(filter.PlatformAdapterType.AIOCQHTTP)
+            if not adapter:
+                return None
+
+            client = adapter.get_client() if hasattr(adapter, "get_client") else getattr(adapter, "bot", None)
+            if not client:
+                return None
+
+            gid: int | str = int(group_id) if group_id.isdigit() else group_id
+            uid: int | str = int(user_id) if user_id.isdigit() else user_id
+
+            call_action = getattr(client, "call_action", None)
+            if callable(call_action):
+                result = await call_action("get_group_member_info", group_id=gid, user_id=uid, no_cache=False)
+            else:
+                api = getattr(client, "api", None)
+                api_call_action = getattr(api, "call_action", None)
+                if not callable(api_call_action):
+                    return None
+                result = await api_call_action("get_group_member_info", group_id=gid, user_id=uid, no_cache=False)
+
+            member = result.get("data") if isinstance(result, dict) and isinstance(result.get("data"), dict) else result
+            if not isinstance(member, dict):
+                return None
+
+            return self._extract_member_level(member)
+        except Exception as ex:
+            logger.warning(f"[抽奖插件] 获取成员群等级失败: {ex}")
+            return None
+
     async def _save_state(self):
         await self.put_kv_data(STATE_KEY, self._state)
 
@@ -691,6 +794,29 @@ class ChouJiangPlugin(Star):
         except Exception:
             return default
         return value
+
+    @staticmethod
+    def _extract_member_level(member: dict[str, Any]) -> int | None:
+        for field in ("level", "card_level", "qq_level", "lv"):
+            raw = member.get(field)
+            if isinstance(raw, int):
+                return raw
+            if isinstance(raw, str):
+                text = raw.strip()
+                if text.isdigit():
+                    return int(text)
+                m = re.search(r"(\d+)", text)
+                if m:
+                    return int(m.group(1))
+        return None
+
+    @staticmethod
+    def _safe_int(raw: Any, *, default: int, minimum: int, maximum: int) -> int:
+        try:
+            value = int(raw)
+        except Exception:
+            return default
+        return max(minimum, min(maximum, value))
 
     def _compute_default_remind_time(self, draw_time: datetime, now: datetime) -> datetime | None:
         delta = self._default_remind_before_delta
